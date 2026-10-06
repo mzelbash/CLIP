@@ -1,4 +1,4 @@
 # CLIP
 
 Live at
-https://github.com/mzelbash/CLIP
+ https://seas8525clip.streamlit.app/
