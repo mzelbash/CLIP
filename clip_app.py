@@ -815,9 +815,10 @@ def sec_one_pair():
             <span>0</span><span>0.15</span><span>0.25</span><span>0.4</span></div>
         </div>""")
 
-    key_idea("Both vectors have length 1, so the cosine is just <b>Σ a<sub>i</sub> b<sub>i</sub></b>. "
-             "Raw CLIP cosines are small: a good match usually lands around <b>0.25 to 0.35</b>, not near 1. "
-             "Try a wrong caption and watch the score drop.")
+    key_idea("Both are <b>unit vectors</b> (length 1), so the cosine is just <b>Σ a<sub>i</sub> b<sub>i</sub></b>. "
+             "Even a perfect match lands around <b>0.25 to 0.35</b>, not 1, because images and captions live in "
+             f"<b style='color:{SPACE}'>two separate regions</b> of the space (Section 6). Training only needs the "
+             "right caption to <b>beat the wrong ones</b>, not to reach 1. Try a wrong caption and watch the score drop.")
 
     code_panel("what happened under the hood", f'''\
 a = model.get_image_features(**image_inputs)    # [1, 512]
@@ -1092,6 +1093,54 @@ print(classes[probs.argmax()])''')
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 6 · EMBEDDING SPACE
 # ═════════════════════════════════════════════════════════════════════════════
+def place_labels(anchors, sizes, points, bounds, iters=400):
+    """Spread label boxes apart in pixel space.
+    anchors: where each label wants to be; sizes: (w, h) per label;
+    points: marker positions labels should not cover; bounds: (x0, y0, x1, y1) of the axes."""
+    anchors = np.asarray(anchors, float)
+    n = len(anchors)
+    center = anchors.mean(0)
+    d = anchors - center
+    d /= np.linalg.norm(d, axis=1, keepdims=True) + 1e-9
+    rng = np.random.default_rng(0)
+    pos = anchors + d * 30 + rng.normal(0, 3, size=anchors.shape)
+    half = sizes / 2.0
+    x0, y0, x1, y1 = bounds
+    for it in range(iters + 300):
+        final = it >= iters                      # last phase: only separate labels, nothing pulls them back
+        moved = 0.0
+        for i in range(n):                       # label vs label
+            for j in range(i + 1, n):
+                dx, dy = pos[j] - pos[i]
+                ox = half[i, 0] + half[j, 0] + 6 - abs(dx)
+                oy = half[i, 1] + half[j, 1] + 6 - abs(dy)
+                if ox > 0 and oy > 0:
+                    if ox < oy:
+                        s = (np.sign(dx) or 1) * ox / 2
+                        pos[i, 0] -= s; pos[j, 0] += s
+                    else:
+                        s = (np.sign(dy) or 1) * oy / 2
+                        pos[i, 1] -= s; pos[j, 1] += s
+                    moved += min(ox, oy)
+        for i in range(n if not final else 0):   # label vs markers
+            for p in points:
+                dx, dy = pos[i] - p
+                ox = half[i, 0] + 9 - abs(dx)
+                oy = half[i, 1] + 9 - abs(dy)
+                if ox > 0 and oy > 0:
+                    if ox < oy:
+                        pos[i, 0] += (np.sign(dx) or 1) * ox * 0.5
+                    else:
+                        pos[i, 1] += (np.sign(dy) or 1) * oy * 0.5
+        if not final:
+            pos += 0.02 * (anchors - pos)        # gentle pull back toward the true point
+        pos[:, 0] = np.clip(pos[:, 0], x0 + half[:, 0] + 2, x1 - half[:, 0] - 2)
+        pos[:, 1] = np.clip(pos[:, 1], y0 + half[:, 1] + 2, y1 - half[:, 1] - 2)
+        if final and moved < 0.5:
+            break
+    return pos
+
+
 def sec_space():
     hero(6, "Inside the shared space", "Where do the image and text vectors actually land?")
     if need_images(3):
@@ -1131,7 +1180,7 @@ def sec_space():
         XY = TSNE(n_components=2, perplexity=max(2, min(5, 2 * n - 1)), random_state=42,
                   init="pca", learning_rate="auto").fit_transform(X)
 
-    fig, ax = plt.subplots(figsize=(9.5, 6.3))
+    fig, ax = plt.subplots(figsize=(10, 7))
     fig.patch.set_facecolor("white")
     ax.set_facecolor("#FAFBFD")
     for s in ax.spines.values():
@@ -1139,39 +1188,67 @@ def sec_space():
     ax.set_xticks([])
     ax.set_yticks([])
 
-    for i, l in enumerate(chosen):
-        c = PAIR_COLORS[i % 8]
-        (ix, iy), (tx, ty) = XY[i], XY[n + i]
-        ax.plot([ix, tx], [iy, ty], color=c, lw=1.6, ls="--", alpha=0.6, zorder=1)
-        thumb = np.asarray(clip_crop(to_pil(POOL[l]["bytes"]), 52))
-        ax.add_artist(AnnotationBbox(OffsetImage(thumb, zoom=1.0), (ix, iy), frameon=True,
-                                     bboxprops=dict(edgecolor=c, linewidth=2.5, boxstyle="round,pad=0.1"),
-                                     zorder=4))
-        ax.scatter(tx, ty, s=260, color=c, edgecolors="white", linewidths=2, zorder=5)
-        ax.annotate(l, (tx, ty), xytext=(10, -4), textcoords="offset points", fontsize=10, color=c,
-                    fontweight="bold", zorder=6)
-
-    ci, ct = XY[:n].mean(0), XY[n:].mean(0)
-    ax.scatter(*ci, marker="X", s=320, color=IMG, edgecolors="white", linewidths=2, zorder=3)
-    ax.scatter(*ct, marker="X", s=320, color=TXT, edgecolors="white", linewidths=2, zorder=3)
-    if not center:
-        ax.annotate("", xy=ct, xytext=ci, arrowprops=dict(arrowstyle="<->", color=SPACE, lw=2.2), zorder=2)
-        mid = (ci + ct) / 2
-        ax.text(mid[0], mid[1], "  modality gap", color=SPACE, fontsize=11, fontweight="bold", zorder=2)
-
-    pad = 0.18 * (XY.max(0) - XY.min(0) + 1e-6)
-    ax.set_xlim(XY[:, 0].min() - pad[0], XY[:, 0].max() + pad[0])
-    ax.set_ylim(XY[:, 1].min() - pad[1], XY[:, 1].max() + pad[1])
+    # generous margins so labels have room to move away from crowded clusters
+    span = XY.max(0) - XY.min(0) + 1e-6
+    ax.set_xlim(XY[:, 0].min() - 0.32 * span[0], XY[:, 0].max() + 0.32 * span[0])
+    ax.set_ylim(XY[:, 1].min() - 0.30 * span[1], XY[:, 1].max() + 0.30 * span[1])
     ax.set_xlabel("PC 1" if method == "PCA" else "t-SNE 1", color="#475569")
     ax.set_ylabel("PC 2" if method == "PCA" else "t-SNE 2", color="#475569")
     ax.legend(handles=[
-        Line2D([0], [0], marker="s", color="w", markerfacecolor="#94A3B8", markersize=11, label="image (thumbnail)"),
+        Line2D([0], [0], marker="s", color="w", markerfacecolor="#94A3B8", markersize=10, label="image"),
         Line2D([0], [0], marker="o", color="w", markerfacecolor="#94A3B8", markersize=11, label="caption"),
         Line2D([0], [0], marker="X", color="w", markerfacecolor=IMG, markersize=12, label="image centroid"),
         Line2D([0], [0], marker="X", color="w", markerfacecolor=TXT, markersize=12, label="text centroid"),
         Line2D([0], [0], ls="--", color="#94A3B8", label="matching pair"),
-    ], loc="upper right", fontsize=9, frameon=True, facecolor="white", edgecolor="#D9E1EC")
-    plt.tight_layout()
+    ], loc="upper center", bbox_to_anchor=(0.5, -0.04), ncol=5, fontsize=10, frameon=False)
+    fig.tight_layout()
+
+    # true positions: small markers that stay exactly where the projection put them
+    ci, ct = XY[:n].mean(0), XY[n:].mean(0)
+    if not center:
+        ax.annotate("", xy=ct, xytext=ci, arrowprops=dict(arrowstyle="<->", color=SPACE, lw=2.2), zorder=2)
+    ax.scatter(*ci, marker="X", s=300, color=IMG, edgecolors="white", linewidths=2, zorder=3)
+    ax.scatter(*ct, marker="X", s=300, color=TXT, edgecolors="white", linewidths=2, zorder=3)
+    for i in range(n):
+        c = PAIR_COLORS[i % 8]
+        (ix, iy), (tx, ty) = XY[i], XY[n + i]
+        ax.plot([ix, tx], [iy, ty], color=c, lw=1.6, ls="--", alpha=0.55, zorder=2)
+        ax.scatter(ix, iy, marker="s", s=80, color=c, edgecolors="white", linewidths=1.5, zorder=5)
+        ax.scatter(tx, ty, marker="o", s=110, color=c, edgecolors="white", linewidths=1.5, zorder=5)
+
+    # labels (thumbnails for images, names for captions) are spread apart by a small solver
+    px_per_pt = fig.dpi / 72
+    thumb_px = 46
+    anchors = ax.transData.transform(np.vstack([XY, ci, ct]))
+    sizes = [(thumb_px * px_per_pt + 16, thumb_px * px_per_pt + 16)] * n
+    sizes += [((len(l) * 6.4 + 16) * px_per_pt, 22 * px_per_pt) for l in chosen]
+    gap_label = "modality gap" if not center else None
+    if gap_label:
+        sizes += [((len(gap_label) * 6.8 + 16) * px_per_pt, 22 * px_per_pt)]
+        label_anchors = np.vstack([anchors[:2 * n], ax.transData.transform((ci + ct) / 2)])
+    else:
+        label_anchors = anchors[:2 * n]
+    box = ax.get_window_extent()
+    pos = place_labels(label_anchors, np.array(sizes), anchors, (box.x0, box.y0, box.x1, box.y1))
+    to_data = ax.transData.inverted()
+
+    for i, l in enumerate(chosen):
+        c = PAIR_COLORS[i % 8]
+        thumb = np.asarray(clip_crop(to_pil(POOL[l]["bytes"]), thumb_px))
+        ax.add_artist(AnnotationBbox(
+            OffsetImage(thumb, zoom=1.0), XY[i], xybox=to_data.transform(pos[i]), boxcoords="data",
+            frameon=True, bboxprops=dict(edgecolor=c, linewidth=2.5, boxstyle="round,pad=0.08"),
+            arrowprops=dict(arrowstyle="-", color=c, lw=1.4, shrinkA=0, shrinkB=4), zorder=6))
+        ax.annotate(l, XY[n + i], xytext=to_data.transform(pos[n + i]), textcoords="data",
+                    ha="center", va="center", fontsize=10, color=c, fontweight="bold", zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.25", facecolor="white", edgecolor=c, linewidth=1.2),
+                    arrowprops=dict(arrowstyle="-", color=c, lw=1.2, shrinkA=0, shrinkB=5))
+    if gap_label:
+        ax.annotate(gap_label, (ci + ct) / 2, xytext=to_data.transform(pos[-1]), textcoords="data",
+                    ha="center", va="center", fontsize=11, color=SPACE, fontweight="bold", zorder=7,
+                    bbox=dict(boxstyle="round,pad=0.25", facecolor=SPACE_BG, edgecolor=SPACE, linewidth=1.2),
+                    arrowprops=dict(arrowstyle="-", color=SPACE, lw=1.2, shrinkA=0, shrinkB=3))
+
 
     off = ~np.eye(n, dtype=bool)
     pair_sim = float(np.mean(np.sum(I * T, axis=1)))
