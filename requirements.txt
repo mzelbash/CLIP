@@ -1,9 +1,9 @@
-streamlit
+streamlit>=1.40
 torch
 torchvision
 transformers
+numpy
+pandas
 matplotlib
-seaborn
 scikit-learn
 pillow
-numpy
